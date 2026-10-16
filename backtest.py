@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import csv
@@ -9,8 +8,17 @@ from pathlib import Path
 from build import CACHE_DB, OUTPUT
 from strategies import resolve_strategy
 
-def run_backtest(strategy_name: str, execution: str = "basic") -> None:
-    strategy = resolve_strategy(strategy_name, execution)
+def run_backtest(
+    strategy_name: str,
+    execution: str = "basic",
+    lambda_buy: float | None = None,
+    lambda_hold: float | None = None,
+    entry_tail_base: float | None = None,
+    hold_tail_base: float | None = None,
+) -> None:
+    strategy = resolve_strategy(
+        strategy_name, execution, lambda_buy, lambda_hold, entry_tail_base, hold_tail_base
+    )
     output_name = strategy["output_name"]
     targets_path = OUTPUT / f"{output_name}_targets.csv"
     if not targets_path.exists():

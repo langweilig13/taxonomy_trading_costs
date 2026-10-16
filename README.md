@@ -12,6 +12,7 @@ python3 run.py momentum --execution basic
 python3 run.py momentum --execution buy_hold
 python3 run.py momentum --execution staggered
 python3 run.py momentum --execution low_cost
+python3 adaptive_sweep.py
 ```
 
 `prepare` читается один раз. Он оставляет исходный архив в `Downloads` нетронутым и создаёт `data/cache/taxonomy.sqlite`.
@@ -30,6 +31,29 @@ python3 run.py momentum --execution low_cost
 decile до построения Momentum. Пока у акции нет доступного lagged `c`, она не
 может попасть в этот universe; matching-процедура статьи для таких пропусков
 ещё не реализована.
+
+## Adaptive buy/hold spread
+
+`adaptive_buy_hold` делает buy/hold границы индивидуальными для каждой акции.
+Он использует доступный lagged Hasbrouck half-spread `c` и рассчитывает:
+
+```text
+b_i,t = clip(0.10 - lambda_b * c_i,t-1, 0.01, 0.10)
+h_i,t = clip(0.20 + lambda_h * c_i,t-1, 0.20, 0.50)
+```
+
+Здесь `b` и `h` — доли хвоста рангов, где 0 — лучшая акция по signal.
+Новая long-позиция открывается при `rank <= b`, а уже открытая закрывается
+только при `rank > h`. Short-сторона симметрична. Для отсутствующего lagged
+`c` применяется обычное правило 10%/20%, а не нулевая стоимость сделки.
+
+```bash
+python3 adaptive_sweep.py
+```
+
+Скрипт проверяет пять начальных пар `lambda_b = lambda_h` (0, 2.5, 5, 10, 20)
+на периоде статьи, июль 1973 — декабрь 2012, и сохраняет сравнение в
+`output/momentum_adaptive_buy_hold_comparison.csv`.
 
 ## Важная договорённость MVP
 

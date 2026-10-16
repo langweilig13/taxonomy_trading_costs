@@ -1,6 +1,50 @@
 """Что предсказываем отдельно от того, как исполняем сделки."""
 
 BASE_STRATEGIES = {
+    "high_frequency_combo": {
+        "title": "High-Frequency Combo",
+        "signal": "high_frequency_combo",
+        "rebalance": "monthly",
+        "breakpoints": "nyse",
+        "long_quantile": 0.90,
+        "short_quantile": 0.10,
+        "weighting": "value_weighted",
+        "start": "1963-07-01",
+        "turnover_group": "high",
+    },
+    "valprof": {
+        "title": "Value + Gross Profitability",
+        "signal": "valprof",
+        "rebalance": "annual",
+        "breakpoints": "nyse",
+        "long_quantile": 0.90,
+        "short_quantile": 0.10,
+        "weighting": "value_weighted",
+        "start": "1963-07-01",
+        "turnover_group": "low",
+    },
+    "investment": {
+        "title": "Investment",
+        "signal": "investment",
+        "rebalance": "annual",
+        "breakpoints": "nyse",
+        "long_quantile": 0.90,
+        "short_quantile": 0.10,
+        "weighting": "value_weighted",
+        "start": "1963-07-01",
+        "turnover_group": "low",
+    },
+    "valmom": {
+        "title": "Value + Momentum",
+        "signal": "valmom",
+        "rebalance": "monthly",
+        "breakpoints": "nyse",
+        "long_quantile": 0.90,
+        "short_quantile": 0.10,
+        "weighting": "value_weighted",
+        "start": "1963-07-01",
+        "turnover_group": "mid",
+    },
     "momentum": {
         "title": "Momentum 12-2",
         "signal": "momentum_12_2",
@@ -10,11 +54,11 @@ BASE_STRATEGIES = {
         "short_quantile": 0.10,
         "weighting": "value_weighted",
         "start": "1963-07-01",
+        "turnover_group": "mid",
     },
 }
 
-# Это не alpha-стратегии. Это политики, которые превращают свежий target
-# portfolio в реально торгуемый portfolio.
+
 EXECUTION_POLICIES = {
     "basic": {
         "title": "Full monthly rebalancing",
@@ -27,6 +71,21 @@ EXECUTION_POLICIES = {
         "hold_long": 0.80,
         "entry_short": 0.10,
         "hold_short": 0.20,
+    },
+    "adaptive_buy_hold": {
+        "title": "Adaptive buy/hold spread",
+        "method": "adaptive_buy_hold",
+        # c в исходном наборе годовой, поэтому используем доступную в t
+        # оценку за прошлый календарный год как c_(i,t-1).
+        "cost_lag_years": 1,
+        "lambda_buy": 0.0,
+        "lambda_hold": 0.0,
+        "entry_tail_base": 0.10,
+        "hold_tail_base": 0.20,
+        "entry_tail_min": 0.01,
+        "entry_tail_max": 0.10,
+        "hold_tail_min": 0.20,
+        "hold_tail_max": 0.50,
     },
     "staggered": {
         "title": "Staggered quarterly rebalancing",
@@ -43,7 +102,14 @@ EXECUTION_POLICIES = {
 }
 
 
-def resolve_strategy(name: str, execution: str = "basic") -> dict:
+def resolve_strategy(
+    name: str,
+    execution: str = "basic",
+    lambda_buy: float | None = None,
+    lambda_hold: float | None = None,
+    entry_tail_base: float | None = None,
+    hold_tail_base: float | None = None,
+) -> dict:
     """Собрать настройки одной комбинации, например Momentum + buy/hold."""
     try:
         base = BASE_STRATEGIES[name]
@@ -54,10 +120,30 @@ def resolve_strategy(name: str, execution: str = "basic") -> dict:
     except KeyError as error:
         raise ValueError(f"Неизвестная execution policy '{execution}'. Доступно: {', '.join(EXECUTION_POLICIES)}") from error
 
-    return {
+    settings = {
         **base,
         **policy,
         "strategy_name": name,
         "execution_name": execution,
-        "output_name": f"{name}_{execution}",
     }
+    if lambda_buy is not None:
+        settings["lambda_buy"] = lambda_buy
+    if lambda_hold is not None:
+        settings["lambda_hold"] = lambda_hold
+    if entry_tail_base is not None:
+        settings["entry_tail_base"] = entry_tail_base
+    if hold_tail_base is not None:
+        settings["hold_tail_base"] = hold_tail_base
+
+    output_name = f"{name}_{execution}"
+    if settings["method"] == "adaptive_buy_hold":
+        output_name += f"_lb{_slug(settings['lambda_buy'])}_lh{_slug(settings['lambda_hold'])}"
+        if entry_tail_base is not None or hold_tail_base is not None:
+            output_name += f"_b{_slug(settings['entry_tail_base'])}_h{_slug(settings['hold_tail_base'])}"
+    settings["output_name"] = output_name
+    return settings
+
+
+def _slug(value: float) -> str:
+    """Безопасная часть имени файла: 2.5 превращается в 2_5."""
+    return f"{value:g}".replace("-", "m").replace(".", "_")

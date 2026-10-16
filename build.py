@@ -8,8 +8,16 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 
-from sources import GIBBS_COST_MEMBER, MONTHLY_STOCK_MEMBER, MONTHLY_STOCK_ZIP
+from sources import (
+    ANNUAL_FUNDAMENTALS_MEMBER,
+    CCM_LINK_MEMBER,
+    FUNDAMENTALS_ZIP,
+    GIBBS_COST_MEMBER,
+    MONTHLY_STOCK_MEMBER,
+    MONTHLY_STOCK_ZIP,
+)
 from strategies import resolve_strategy
+from ff49 import industry as ff49_industry, load_ranges as load_ff49_ranges
 
 ROOT = Path(__file__).parent
 CACHE_DB = ROOT / "data" / "cache" / "taxonomy.sqlite"
@@ -48,6 +56,7 @@ def prepare_monthly_data() -> None:
                 ret REAL NOT NULL,
                 market_cap REAL NOT NULL,
                 exchange TEXT NOT NULL,
+                sic INTEGER,
                 PRIMARY KEY (date, permno)
             );
             """
@@ -75,19 +84,23 @@ def prepare_monthly_data() -> None:
                         if ret is None or market_cap is None or market_cap <= 0:
                             continue
 
-                        batch.append((row["MthCalDt"], row["PERMNO"], ret, market_cap, row["PrimaryExch"]))
+                        batch.append((
+                            row["MthCalDt"], row["PERMNO"], ret, market_cap,
+                            row["PrimaryExch"], number(row["SICCD"]),
+                        ))
                         if len(batch) == 10_000:
-                            db.executemany("INSERT OR REPLACE INTO monthly_stock VALUES (?, ?, ?, ?, ?)", batch)
+                            db.executemany("INSERT OR REPLACE INTO monthly_stock VALUES (?, ?, ?, ?, ?, ?)", batch)
                             inserted += len(batch)
                             batch.clear()
 
                     if batch:
-                        db.executemany("INSERT OR REPLACE INTO monthly_stock VALUES (?, ?, ?, ?, ?)", batch)
+                        db.executemany("INSERT OR REPLACE INTO monthly_stock VALUES (?, ?, ?, ?, ?, ?)", batch)
                         inserted += len(batch)
 
         db.execute("CREATE INDEX IF NOT EXISTS idx_monthly_permno_date ON monthly_stock (permno, date)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_monthly_date ON monthly_stock (date)")
         _prepare_effective_costs(db)
+        _prepare_accounting_data(db)
         db.commit()
 
     print(f"Готово: {inserted:,} строк сохранено в {CACHE_DB}")
@@ -129,6 +142,68 @@ def _prepare_effective_costs(db: sqlite3.Connection) -> None:
                 inserted += len(batch)
     db.execute("CREATE INDEX IF NOT EXISTS idx_cost_year ON effective_cost (year)")
     print(f"Effective costs: {inserted:,} PERMNO-year наблюдений загружено")
+
+
+def _prepare_accounting_data(db: sqlite3.Connection) -> None:
+    """Загрузить только поля Compustat и CCM, нужные пяти выбранным стратегиям."""
+    db.executescript(
+        """
+        DROP TABLE IF EXISTS annual_fundamental;
+        CREATE TABLE annual_fundamental (
+            gvkey TEXT NOT NULL,
+            datadate TEXT NOT NULL,
+            sic INTEGER,
+            at REAL, revt REAL, cogs REAL, ppegt REAL, invt REAL,
+            seq REAL, ceq REAL, lt REAL, txditc REAL,
+            pstkrv REAL, pstkl REAL, pstk REAL,
+            PRIMARY KEY (gvkey, datadate)
+        );
+        DROP TABLE IF EXISTS ccm_link;
+        CREATE TABLE ccm_link (
+            gvkey TEXT NOT NULL,
+            permno TEXT NOT NULL,
+            link_start TEXT NOT NULL,
+            link_end TEXT NOT NULL,
+            PRIMARY KEY (gvkey, permno, link_start)
+        );
+        """
+    )
+    with zipfile.ZipFile(FUNDAMENTALS_ZIP) as archive:
+        with archive.open(ANNUAL_FUNDAMENTALS_MEMBER) as compressed:
+            with gzip.GzipFile(fileobj=compressed) as unzipped:
+                reader = csv.DictReader(io.TextIOWrapper(unzipped, encoding="utf-8"))
+                batch = []
+                for row in reader:
+                    if not (row["datafmt"] == "STD" and row["indfmt"] == "INDL" and row["consol"] == "C"):
+                        continue
+                    if row["costat"] not in {"A", "I"} or not row["datadate"]:
+                        continue
+                    batch.append((
+                        row["gvkey"], row["datadate"], number(row["sic"]), number(row["at"]),
+                        number(row["revt"]), number(row["cogs"]), number(row["ppegt"]), number(row["invt"]),
+                        number(row["seq"]), number(row["ceq"]), number(row["lt"]), number(row["txditc"]),
+                        number(row["pstkrv"]), number(row["pstkl"]), number(row["pstk"]),
+                    ))
+                    if len(batch) >= 10_000:
+                        db.executemany("INSERT OR REPLACE INTO annual_fundamental VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
+                        batch.clear()
+                if batch:
+                    db.executemany("INSERT OR REPLACE INTO annual_fundamental VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
+        with archive.open(CCM_LINK_MEMBER) as compressed:
+            with gzip.GzipFile(fileobj=compressed) as raw_file:
+                reader = csv.DictReader(io.TextIOWrapper(raw_file, encoding="utf-8"))
+                batch = []
+                for row in reader:
+                    if row["LINKTYPE"] not in {"LC", "LU", "LS"} or not row["LPERMNO"]:
+                        continue
+                    batch.append((row["gvkey"], row["LPERMNO"], row["LINKDT"], row["LINKENDDT"] or "9999-12-31"))
+                    if len(batch) >= 10_000:
+                        db.executemany("INSERT OR REPLACE INTO ccm_link VALUES (?, ?, ?, ?)", batch)
+                        batch.clear()
+                if batch:
+                    db.executemany("INSERT OR REPLACE INTO ccm_link VALUES (?, ?, ?, ?)", batch)
+    db.execute("CREATE INDEX idx_annual_gvkey_date ON annual_fundamental (gvkey, datadate)")
+    db.execute("CREATE INDEX idx_ccm_permno_dates ON ccm_link (permno, link_start, link_end)")
 
 
 def calculate_momentum_signals(db: sqlite3.Connection) -> None:
@@ -173,6 +248,55 @@ def calculate_momentum_signals(db: sqlite3.Connection) -> None:
     if batch:
         db.executemany("INSERT INTO momentum_signal VALUES (?, ?, ?)", batch)
     db.execute("CREATE INDEX idx_momentum_date ON momentum_signal (date)")
+    db.commit()
+
+
+def calculate_high_frequency_combo_signals(db: sqlite3.Connection) -> None:
+    """Industry momentum + industry-relative reversal по FF49 industries."""
+    db.executescript(
+        """
+        DROP TABLE IF EXISTS high_frequency_combo_signal;
+        CREATE TABLE high_frequency_combo_signal (
+            date TEXT NOT NULL,
+            permno TEXT NOT NULL,
+            signal REAL NOT NULL,
+            PRIMARY KEY (date, permno)
+        );
+        """
+    )
+    ranges = load_ff49_ranges()
+    dates = [row[0] for row in db.execute("SELECT DISTINCT date FROM monthly_stock ORDER BY date")]
+    batch = []
+    for previous_date, date in zip(dates, dates[1:]):
+        previous = db.execute(
+            "SELECT permno, ret, market_cap, sic FROM monthly_stock WHERE date = ?", (previous_date,)
+        ).fetchall()
+        totals: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        observations = []
+        for permno, ret, market_cap, sic in previous:
+            group = ff49_industry(sic, ranges)
+            if group is None:
+                continue
+            totals[group][0] += market_cap * ret
+            totals[group][1] += market_cap
+            observations.append((permno, ret, group))
+        industry_return = {group: numerator / denominator for group, (numerator, denominator) in totals.items() if denominator}
+        components = [
+            {"permno": permno, "industry_momentum": industry_return[group],
+             "relative_reversal": industry_return[group] - ret}
+            for permno, ret, group in observations if group in industry_return
+        ]
+        momentum_rank = _percentile_ranks(components, "industry_momentum")
+        reversal_rank = _percentile_ranks(components, "relative_reversal")
+        for row in components:
+            permno = row["permno"]
+            batch.append((date, permno, momentum_rank[permno] + reversal_rank[permno]))
+        if len(batch) >= 10_000:
+            db.executemany("INSERT INTO high_frequency_combo_signal VALUES (?, ?, ?)", batch)
+            batch.clear()
+    if batch:
+        db.executemany("INSERT INTO high_frequency_combo_signal VALUES (?, ?, ?)", batch)
+    db.execute("CREATE INDEX idx_hfc_date ON high_frequency_combo_signal (date)")
     db.commit()
 
 
@@ -238,6 +362,80 @@ def select_buy_hold_portfolio(
     return weights, next_long, next_short
 
 
+def select_adaptive_buy_hold_portfolio(
+    rows: list[sqlite3.Row], strategy: dict, held_long: set[str], held_short: set[str]
+) -> tuple[dict[str, float], set[str], set[str]]:
+    """Buy/hold с индивидуальными границами, зависящими от lagged half-spread.
+
+    b_i = clip(0.10 - lambda_b * c_i, 0.01, 0.10) задаёт узкий хвост
+    для нового входа. h_i = clip(0.20 + lambda_h * c_i, 0.20, 0.50)
+    задаёт более широкий хвост, в котором старую позицию можно сохранить.
+    """
+    nyse_signals = sorted(row["signal"] for row in rows if row["exchange"] == "N")
+    if len(nyse_signals) < 10:
+        return {}, set(), set()
+
+    def cutoff(quantile: float) -> float:
+        quantile = min(1.0, max(0.0, quantile))
+        return nyse_signals[int((len(nyse_signals) - 1) * quantile)]
+
+    def clip(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def bounds(row: sqlite3.Row) -> tuple[float, float]:
+        # У части бумаг нет c. Не считаем их бесплатно и не исключаем из alpha
+        # universe: в signal rule для них остаётся обычное 10%/20% правило.
+        c = row["lagged_c"]
+        if c is None:
+            return strategy["entry_tail_base"], strategy["hold_tail_base"]
+        buy_tail = clip(
+            strategy["entry_tail_base"] - strategy["lambda_buy"] * c,
+            strategy["entry_tail_min"], strategy["entry_tail_max"],
+        )
+        hold_tail = clip(
+            strategy["hold_tail_base"] + strategy["lambda_hold"] * c,
+            strategy["hold_tail_min"], strategy["hold_tail_max"],
+        )
+        return buy_tail, hold_tail
+
+    by_permno = {row["permno"]: row for row in rows}
+    next_long = {
+        permno for permno in held_long
+        if permno in by_permno
+        and by_permno[permno]["signal"] >= cutoff(1.0 - bounds(by_permno[permno])[1])
+    }
+    next_short = {
+        permno for permno in held_short
+        if permno in by_permno
+        and by_permno[permno]["signal"] <= cutoff(bounds(by_permno[permno])[1])
+    }
+    next_long |= {
+        row["permno"] for row in rows
+        if row["signal"] >= cutoff(1.0 - bounds(row)[0])
+    }
+    next_short |= {
+        row["permno"] for row in rows
+        if row["signal"] <= cutoff(bounds(row)[0])
+    }
+    # При h=50% границы могут встретиться на медиане; не допускаем long и short
+    # по одной бумаге одновременно.
+    overlap = next_long & next_short
+    next_long -= overlap
+    next_short -= overlap
+
+    long_rows = [by_permno[permno] for permno in next_long]
+    short_rows = [by_permno[permno] for permno in next_short]
+    long_cap = sum(row["market_cap"] for row in long_rows)
+    short_cap = sum(row["market_cap"] for row in short_rows)
+    if not long_cap or not short_cap:
+        return {}, set(), set()
+
+    weights = {row["permno"]: 0.5 * row["market_cap"] / long_cap for row in long_rows}
+    for row in short_rows:
+        weights[row["permno"]] = weights.get(row["permno"], 0.0) - 0.5 * row["market_cap"] / short_cap
+    return weights, next_long, next_short
+
+
 def average_sleeves(sleeves: list[dict[str, float]]) -> dict[str, float]:
     """Сложить mini-portfolios и разделить веса на число слоёв."""
     combined: dict[str, float] = defaultdict(float)
@@ -279,16 +477,104 @@ def select_low_cost_universe(rows: list[sqlite3.Row], strategy: dict) -> list[sq
             and row["lagged_c"] <= cost_cutoff[size_bin(row["market_cap"])]]
 
 
-def write_transactions(strategy_name: str, db: sqlite3.Connection, execution: str = "basic") -> None:
-    """Из последовательности target weights создать читаемый журнал сделок."""
-    strategy = resolve_strategy(strategy_name, execution)
-    output_name = strategy["output_name"]
-    if strategy["signal"] != "momentum_12_2":
-        raise NotImplementedError("В MVP пока реализован только signal momentum_12_2.")
+def _percentile_ranks(rows: list[dict], field: str) -> dict[str, float]:
+    """Нормализованный rank: 0 = низкое значение, 1 = высокое."""
+    usable = sorted((row[field], row["permno"]) for row in rows if row[field] is not None)
+    if len(usable) < 2:
+        return {}
+    return {permno: index / (len(usable) - 1) for index, (_, permno) in enumerate(usable)}
 
+
+def _signal_rows(db: sqlite3.Connection, date: str, strategy: dict) -> list[dict]:
+    """Вернуть единый срез с signal независимо от его источника."""
+    signal = strategy["signal"]
+    if signal == "momentum_12_2":
+        rows = db.execute(
+            """
+            SELECT s.permno, s.signal, m.market_cap, m.exchange, c.c_log AS lagged_c
+            FROM momentum_signal s
+            JOIN monthly_stock m ON m.date = s.date AND m.permno = s.permno
+            LEFT JOIN effective_cost c ON c.permno = s.permno
+              AND c.year = CAST(substr(s.date, 1, 4) AS INTEGER) - ?
+            WHERE s.date = ?
+            """, (strategy.get("cost_lag_years", 0), date)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    if signal == "high_frequency_combo":
+        rows = db.execute(
+            """
+            SELECT s.permno, s.signal, m.market_cap, m.exchange, c.c_log AS lagged_c
+            FROM high_frequency_combo_signal s
+            JOIN monthly_stock m ON m.date = s.date AND m.permno = s.permno
+            LEFT JOIN effective_cost c ON c.permno = s.permno
+              AND c.year = CAST(substr(s.date, 1, 4) AS INTEGER) - ?
+            WHERE s.date = ?
+            """, (strategy.get("cost_lag_years", 0), date)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    rows = [dict(row) for row in db.execute(
+        """
+        SELECT m.permno, m.market_cap, m.exchange, c.c_log AS lagged_c,
+               a.book_to_market, a.gross_profitability, a.investment, ms.signal AS momentum
+        FROM monthly_stock m
+        JOIN annual_characteristic a ON a.permno = m.permno
+          AND a.available_from = (
+              SELECT MAX(a2.available_from) FROM annual_characteristic a2
+              WHERE a2.permno = m.permno AND a2.available_from <= m.date
+          )
+        LEFT JOIN momentum_signal ms ON ms.date = m.date AND ms.permno = m.permno
+        LEFT JOIN effective_cost c ON c.permno = m.permno
+          AND c.year = CAST(substr(m.date, 1, 4) AS INTEGER) - ?
+        WHERE m.date = ?
+        """, (strategy.get("cost_lag_years", 0), date)
+    )]
+    if signal == "investment":
+        for row in rows:
+            row["signal"] = row["investment"]
+    elif signal == "valprof":
+        value_rank = _percentile_ranks(rows, "book_to_market")
+        profit_rank = _percentile_ranks(rows, "gross_profitability")
+        for row in rows:
+            row["signal"] = (
+                value_rank.get(row["permno"]) + profit_rank.get(row["permno"])
+                if row["permno"] in value_rank and row["permno"] in profit_rank else None
+            )
+    elif signal == "valmom":
+        value_rank = _percentile_ranks(rows, "book_to_market")
+        momentum_rank = _percentile_ranks(rows, "momentum")
+        for row in rows:
+            row["signal"] = (
+                value_rank.get(row["permno"]) + momentum_rank.get(row["permno"])
+                if row["permno"] in value_rank and row["permno"] in momentum_rank else None
+            )
+    else:
+        raise NotImplementedError(f"Signal {signal} пока не реализован.")
+    return [row for row in rows if row["signal"] is not None]
+
+
+def write_transactions(
+    strategy_name: str,
+    db: sqlite3.Connection,
+    execution: str = "basic",
+    lambda_buy: float | None = None,
+    lambda_hold: float | None = None,
+    entry_tail_base: float | None = None,
+    hold_tail_base: float | None = None,
+) -> None:
+    """Из последовательности target weights создать читаемый журнал сделок."""
+    strategy = resolve_strategy(
+        strategy_name, execution, lambda_buy, lambda_hold, entry_tail_base, hold_tail_base
+    )
+    output_name = strategy["output_name"]
     calculate_momentum_signals(db)
+    if strategy["signal"] == "high_frequency_combo":
+        calculate_high_frequency_combo_signals(db)
     db.row_factory = sqlite3.Row
-    dates = [row[0] for row in db.execute("SELECT DISTINCT date FROM momentum_signal ORDER BY date")]
+    dates = [row[0] for row in db.execute("SELECT DISTINCT date FROM monthly_stock ORDER BY date")]
+    if strategy["rebalance"] == "annual":
+        dates = [date for date in dates if date[5:7] == "07"]
 
     targets: list[tuple[str, str, float]] = []
     trades: list[dict] = []
@@ -299,20 +585,15 @@ def write_transactions(strategy_name: str, db: sqlite3.Connection, execution: st
     next_sleeve = 0
 
     for date in dates:
-        rows = db.execute(
-            """
-            SELECT s.permno, s.signal, m.market_cap, m.exchange, c.c_log AS lagged_c
-            FROM momentum_signal s
-            JOIN monthly_stock m ON m.date = s.date AND m.permno = s.permno
-            LEFT JOIN effective_cost c
-              ON c.permno = s.permno
-             AND c.year = CAST(substr(s.date, 1, 4) AS INTEGER) - ?
-            WHERE s.date = ? AND s.date >= ?
-            """,
-            (strategy.get("cost_lag_years", 0), date, strategy["start"]),
-        ).fetchall()
+        if date < strategy["start"]:
+            continue
+        rows = _signal_rows(db, date, strategy)
         if strategy["method"] == "buy_hold":
             new_weights, held_long, held_short = select_buy_hold_portfolio(
+                rows, strategy, held_long, held_short
+            )
+        elif strategy["method"] == "adaptive_buy_hold":
+            new_weights, held_long, held_short = select_adaptive_buy_hold_portfolio(
                 rows, strategy, held_long, held_short
             )
         elif strategy["method"] == "staggered":
